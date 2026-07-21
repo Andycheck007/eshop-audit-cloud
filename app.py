@@ -1,514 +1,424 @@
 import streamlit as st
-import asyncio
-import os
-import json
-import re
-import subprocess
-import sys
-from datetime import datetime
-from playwright.async_api import async_playwright
+import requests
 from bs4 import BeautifulSoup
-from google import genai
+from urllib.parse import urljoin, urlparse
+import json
+import base64
+from io import BytesIO
+from PIL import Image
+import google.generativeai as genai
 
-# ============================================================
-# PLAYWRIGHT SETUP (pre cloud)
-# ============================================================
-
-@st.cache_resource
-def install_playwright():
-    """Nainštaluje Chromium pri prvom spustení."""
-    subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        check=True
-    )
-    return True
-
-install_playwright()
-
-# ============================================================
-# KONFIGURÁCIA
-# ============================================================
-
-st.set_page_config(
-    page_title="E-shop Audit Tool",
-    page_icon="🔍",
-    layout="wide"
-)
-
-# ============================================================
-# POMOCNÉ FUNKCIE
-# ============================================================
-
-def markdown_to_html(md_text):
-    """Jednoduchý prevod Markdown na HTML."""
-    lines = md_text.split("\n")
-    html_lines = []
-    in_list = False
-    in_code = False
-
-    for line in lines:
-        if line.strip().startswith("```"):
-            if in_code:
-                html_lines.append("</pre>")
-                in_code = False
-            else:
-                html_lines.append("<pre>")
-                in_code = True
-            continue
-
-        if in_code:
-            html_lines.append(line)
-            continue
-
-        if line.startswith("### "):
-            if in_list:
-                html_lines.append("</ul>")
-                in_list = False
-            html_lines.append(f"<h3>{line[4:]}</h3>")
-        elif line.startswith("## "):
-            if in_list:
-                html_lines.append("</ul>")
-                in_list = False
-            html_lines.append(f"<h2>{line[3:]}</h2>")
-        elif line.startswith("# "):
-            if in_list:
-                html_lines.append("</ul>")
-                in_list = False
-            html_lines.append(f"<h2>{line[2:]}</h2>")
-        elif line.strip().startswith("- ") or line.strip().startswith("* "):
-            if not in_list:
-                html_lines.append("<ul>")
-                in_list = True
-            content = re.sub(r"^\s*[-*]\s*", "", line)
-            content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", content)
-            content = re.sub(r"`(.+?)`", r"<code>\1</code>", content)
-            html_lines.append(f"<li>{content}</li>")
-        else:
-            if in_list:
-                html_lines.append("</ul>")
-                in_list = False
-            line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
-            line = re.sub(r"`(.+?)`", r"<code>\1</code>", line)
-            if line.strip():
-                html_lines.append(f"<p>{line}</p>")
-
-    if in_list:
-        html_lines.append("</ul>")
-    return "\n".join(html_lines)
-
-
-async def ziskaj_data_stranky(url, viewport_width, viewport_height):
-    """Odfotí stránku a vytiahne HTML metadata."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page(
-            viewport={"width": viewport_width, "height": viewport_height}
-        )
-
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(2000)
-
-            screenshot = await page.screenshot(full_page=True)
-            html = await page.content()
-            soup = BeautifulSoup(html, "lxml")
-
-            title = soup.title.string if soup.title else "CHÝBA TITLE"
-
-            meta_desc = ""
-            meta_tag = soup.find("meta", attrs={"name": "description"})
-            if meta_tag:
-                meta_desc = meta_tag.get("content", "")
-
-            headings = {}
-            for level in range(1, 7):
-                tags = soup.find_all(f"h{level}")
-                if tags:
-                    headings[f"h{level}"] = [
-                        tag.get_text(strip=True) for tag in tags
-                    ]
-
-            links = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                text = a.get_text(strip=True)
-                if href.startswith("/") or url.split("//")[1].split("/")[0] in href:
-                    links.append({"href": href, "text": text or "(bez textu)"})
-
-            images_no_alt = []
-            for img in soup.find_all("img"):
-                alt = img.get("alt", "").strip()
-                src = img.get("src", "")
-                if not alt:
-                    images_no_alt.append(src[:100])
-
-            canonical = ""
-            can_tag = soup.find("link", attrs={"rel": "canonical"})
-            if can_tag:
-                canonical = can_tag.get("href", "")
-
-            seo_data = {
-                "url": url,
-                "title": title,
-                "meta_description": meta_desc,
-                "canonical": canonical,
-                "headings": headings,
-                "internal_links_count": len(links),
-                "internal_links_sample": links[:20],
-                "images_without_alt": images_no_alt[:10],
-                "images_without_alt_count": len(images_no_alt),
-            }
-
-            await browser.close()
-            return screenshot, seo_data
-
-        except Exception as e:
-            await browser.close()
-            return None, {"url": url, "error": str(e)}
-
-
-def analyzuj_gemini(api_key, screenshots_desktop, screenshots_mobile,
-                    seo_data_list, hlavna_url, podstranky):
-    """Pošle všetko do Gemini na analýzu."""
-
-    client = genai.Client(api_key=api_key)
-
-    seo_json = json.dumps(seo_data_list, ensure_ascii=False, indent=2)
-
-    prompt = f"""
-Si expert na UX/UI, SEO, konverzie a e-commerce s 15+ rokmi skúseností.
-Proveď kompletný audit e-shopu na základe priložených screenshotov
-a SEO dát.
-
-HLAVNÁ STRÁNKA: {hlavna_url}
-PODSTRÁNKY: {json.dumps(podstranky, ensure_ascii=False)}
-
-SEO DÁTA (extrahované z HTML):
-{seo_json}
-
-ANALYZUJ TIETO OBLASTI:
-
-### 1. ŠTRUKTÚRA WEBU A LOGIKA PODSTRÁNOK
-- Je rozdelenie podstránok logické?
-- Chýba niečo dôležité? (napr. referencie, galéria, cenník)
-- Je hĺbka navigácie optimálna?
-
-### 2. NÁZVOSLOVIE A URL SLUGY
-- Sú URL slugy konzistentné a SEO-friendly?
-- Sú názvy kategórií a stránok zrozumiteľné?
-
-### 3. SEO ANALÝZA
-- Title tagy: dĺžka, kľúčové slová, unikátnosť
-- Meta description: kvalita, CTA, dĺžka
-- Heading štruktúra (H1-H6): hierarchia, duplicity
-- Alt texty obrázkov
-- Interné linkovanie
-
-### 4. LINKOVANIE
-- Interné prepojenie medzi stránkami
-- Breadcrumbs
-- CTA linky smerujúce k konverzii
-
-### 5. OBSAH A PRODUKTOVÉ POPISKY
-- Kvalita a dĺžka textov
-- Unikátnosť
-- Odpovedajú texty na otázky zákazníkov?
-
-### 6. UX/UI DESIGN
-- Vizuálna hierarchia
-- Konzistencia dizajnu
-- Mobilná verzia (hodnoť s váhou 60%)
-
-### 7. KONVERZIE
-- CTA tlačidlá
-- Nákupný proces
-- Dôveryhodnosť
-
-PRE KAŽDÚ OBLASŤ UVEĎ:
-- ✅ Čo funguje dobre (konkrétne príklady)
-- ❌ Čo je problém (konkrétne príklady)
-- 💡 Doporučenie na zlepšenie (konkrétne kroky)
-- 📊 Skóre 1-10
-
-NAVYŠE PRE KAŽDÝ NÁJDENÝ PROBLÉM DODAJ HOTOVÉ RIEŠENIE:
-
-SEO OPRAVY (copy-paste ready):
-- Navrhni lepší TITLE tag (do 60 znakov)
-- Navrhni lepší META DESCRIPTION (do 155 znakov, s CTA)
-- Navrhni správnu H1-H6 štruktúru
-- Navrhni ALT texty pre obrázky bez nich
-
-TEXTOVÉ NÁVRHY:
-- Prepíš slabé produktové popisky
-- Navrhni lepšie CTA texty na tlačidlá
-- Navrhni FAQ otázky, ktoré na webe chýbajú
-
-UX ODPORÚČANIA:
-- Konkrétne popisy čo kam presunúť
-- Aké prvky pridať nad fold
-- Ako zlepšiť mobilnú navigáciu
-
-TECHNICKÉ ÚLOHY:
-- Zoznam úloh pre vývojára (formát checklistu)
-- Priorita: VYSOKÁ / STREDNÁ / NÍZKA
-- Odhadovaný čas realizácie
-
-NA KONCI VYTVOR:
-1. CELKOVÉ SKÓRE (priemer všetkých oblastí)
-2. TOP 5 PRIORÍT (čo opraviť ako prvé)
-3. QUICK WINS (čo sa dá opraviť za menej ako 1 hodinu)
-4. ODHAD DOPADU NA KONVERZIE (v %)
-
-Odpovedaj v slovenčine. Buď konkrétny, uvádzaj príklady priamo
-z analyzovaných stránok. Formátuj výstup tak, aby sa dal priamo
-poslať vývojárovi alebo copywriterovi ako zadanie.
-"""
-
-    contents = [prompt]
-
-    for url, screenshot in screenshots_desktop:
-        if screenshot:
-            contents.append(f"\n--- DESKTOP screenshot: {url} ---")
-            contents.append(
-                genai.types.Part.from_bytes(
-                    data=screenshot,
-                    mime_type="image/png"
-                )
-            )
-
-    for url, screenshot in screenshots_mobile:
-        if screenshot:
-            contents.append(f"\n--- MOBILNÝ screenshot: {url} ---")
-            contents.append(
-                genai.types.Part.from_bytes(
-                    data=screenshot,
-                    mime_type="image/png"
-                )
-            )
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-    )
-
-    return response.text
-
-
-# ============================================================
-# STREAMLIT UI
-# ============================================================
+# ── Konfigurácia stránky ──
+st.set_page_config(page_title="E-shop Audit Tool", page_icon="🔍", layout="wide")
 
 st.title("🔍 E-shop Audit Tool")
 st.markdown(
-    "Zadaj URL e-shopu, klikni **Spustiť audit** a dostaneš "
-    "kompletný UX, SEO a konverzný report s konkrétnymi návrhmi na zlepšenie."
+    "Zadaj URL e-shopu, klikni **Spustiť audit** a dostaneš kompletný UX, SEO "
+    "a konverzný report s konkrétnymi návrhmi na zlepšenie."
 )
 
-st.divider()
+# ── Vstupy ──
+gemini_key = st.text_input("🔑 Gemini API kľúč", type="password")
+homepage_url = st.text_input("🏠 URL hlavnej stránky e-shopu", placeholder="https://www.example.sk/")
 
-# API kľúč
-api_key_env = os.environ.get("GEMINI_API_KEY", "")
+st.subheader("📄 Podstránky na audit (max 10)")
+st.caption("Zadaj relatívne cesty (napr. /produkty/) alebo plné URL, každú na nový riadok")
+subpages_text = st.text_area(
+    "Podstránky",
+    value="/kategoria/\n/produkt/\n/kosik/\n/kontakt/\n/blog/",
+    height=150,
+)
 
-if api_key_env:
-    api_key = api_key_env
-    st.success("🔑 API kľúč načítaný z nastavení")
-else:
-    api_key = st.text_input(
-        "🔑 Gemini API kľúč",
-        type="password",
-        help="Získaš ho zadarmo na aistudio.google.com → Get API Key"
+
+# ── Pomocné funkcie ──
+
+def normalize_url(base, path):
+    """Spojí base URL a relatívnu cestu."""
+    path = path.strip()
+    if not path:
+        return None
+    if path.startswith("http"):
+        return path
+    return urljoin(base, path)
+
+
+def fetch_html(url, timeout=15):
+    """Stiahne HTML stránky."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding
+        return resp.text
+    except Exception as e:
+        return None
+
+
+def analyze_html(url, html):
+    """Extrahuje SEO a štruktúrne dáta z HTML."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    title_tag = soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else ""
+
+    meta_desc_tag = soup.find("meta", attrs={"name": "description"})
+    meta_desc = meta_desc_tag.get("content", "") if meta_desc_tag else ""
+
+    meta_viewport = soup.find("meta", attrs={"name": "viewport"})
+    has_viewport = meta_viewport is not None
+
+    canonical_tag = soup.find("link", attrs={"rel": "canonical"})
+    canonical = canonical_tag.get("href", "") if canonical_tag else ""
+
+    og_tags = {}
+    for og in soup.find_all("meta", attrs={"property": lambda x: x and x.startswith("og:")}):
+        og_tags[og.get("property", "")] = og.get("content", "")
+
+    headings = {}
+    for level in range(1, 7):
+        tag = f"h{level}"
+        found = soup.find_all(tag)
+        if found:
+            headings[tag] = [h.get_text(strip=True)[:100] for h in found[:10]]
+
+    images = soup.find_all("img")
+    total_images = len(images)
+    images_without_alt = []
+    for img in images:
+        alt = img.get("alt", None)
+        if alt is None or alt.strip() == "":
+            src = img.get("src", "")[:120]
+            images_without_alt.append(src)
+
+    links = soup.find_all("a", href=True)
+    internal_links = 0
+    external_links = 0
+    parsed_base = urlparse(url)
+    for link in links:
+        href = link["href"]
+        if href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
+            continue
+        parsed_href = urlparse(urljoin(url, href))
+        if parsed_href.netloc == parsed_base.netloc:
+            internal_links += 1
+        else:
+            external_links += 1
+
+    scripts = soup.find_all("script", src=True)
+    stylesheets = soup.find_all("link", attrs={"rel": "stylesheet"})
+
+    forms = soup.find_all("form")
+    has_search = any(
+        inp.get("type") == "search"
+        or "search" in (inp.get("name", "") + inp.get("placeholder", "")).lower()
+        for form in forms
+        for inp in form.find_all("input")
     )
 
-hlavna_url = st.text_input(
-    "🏠 URL hlavnej stránky e-shopu",
-    placeholder="https://www.example.sk/"
-)
+    structured_data = []
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                structured_data.append(data.get("@type", "unknown"))
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        structured_data.append(item.get("@type", "unknown"))
+        except Exception:
+            pass
 
-st.markdown("#### 📄 Podstránky na audit (max 10)")
-st.caption(
-    "Zadaj relatívne cesty (napr. /produkty/) alebo plné URL, "
-    "každú na nový riadok"
-)
+    text_content = soup.get_text(separator=" ", strip=True)
+    word_count = len(text_content.split())
 
-podstranky_text = st.text_area(
-    "Podstránky",
-    placeholder="/kategoria/\n/produkt/\n/kosik/\n/kontakt/\n/blog/",
-    height=200
-)
+    return {
+        "url": url,
+        "title": title,
+        "title_length": len(title),
+        "meta_description": meta_desc,
+        "meta_description_length": len(meta_desc),
+        "has_viewport": has_viewport,
+        "canonical": canonical,
+        "og_tags": og_tags,
+        "headings": headings,
+        "total_images": total_images,
+        "images_without_alt": images_without_alt[:15],
+        "images_without_alt_count": len(images_without_alt),
+        "internal_links": internal_links,
+        "external_links": external_links,
+        "scripts_count": len(scripts),
+        "stylesheets_count": len(stylesheets),
+        "has_search": has_search,
+        "forms_count": len(forms),
+        "structured_data_types": structured_data,
+        "word_count": word_count,
+    }
 
-st.divider()
 
-if st.button("🚀 Spustiť audit", type="primary", use_container_width=True):
+def get_screenshot_url(url):
+    """Vráti URL screenshotu cez bezplatnú API službu."""
+    # Používame Google PageSpeed screenshot alebo thum.io
+    return f"https://image.thum.io/get/width/1280/crop/800/noanimate/{url}"
 
-    if not api_key:
-        st.error("❌ Zadaj Gemini API kľúč!")
-        st.stop()
 
-    if not hlavna_url:
-        st.error("❌ Zadaj URL hlavnej stránky!")
-        st.stop()
-
-    if not hlavna_url.startswith("http"):
-        hlavna_url = "https://" + hlavna_url
-
-    podstranky = [
-        line.strip() for line in podstranky_text.strip().split("\n")
-        if line.strip()
-    ][:10]
-
-    base = hlavna_url.rstrip("/")
-    vsetky_url = [hlavna_url]
-    for sub in podstranky:
-        if sub.startswith("http"):
-            vsetky_url.append(sub)
-        else:
-            vsetky_url.append(base + sub)
-
-    st.info(f"📋 Auditujem {len(vsetky_url)} stránok (desktop + mobil)...")
-
-    progress = st.progress(0)
-    status = st.empty()
-
-    screenshots_desktop = []
-    screenshots_mobile = []
-    seo_data_list = []
-
-    total_steps = len(vsetky_url) * 2
-
-    for i, url in enumerate(vsetky_url):
-        status.text(f"💻 Desktop: {url}")
-        screenshot, seo_data = asyncio.run(
-            ziskaj_data_stranky(url, 1440, 900)
-        )
-        screenshots_desktop.append((url, screenshot))
-        seo_data_list.append(seo_data)
-        progress.progress((i * 2 + 1) / total_steps)
-
-        status.text(f"📱 Mobil: {url}")
-        screenshot_m, _ = asyncio.run(
-            ziskaj_data_stranky(url, 390, 844)
-        )
-        screenshots_mobile.append((url, screenshot_m))
-        progress.progress((i * 2 + 2) / total_steps)
-
-    progress.progress(1.0)
-    status.text("🤖 Analyzujem pomocou Gemini AI... (môže trvať 1-2 minúty)")
-
-    with st.expander("📸 Screenshoty", expanded=False):
-        for url, screenshot in screenshots_desktop:
-            if screenshot:
-                st.markdown(f"**💻 Desktop:** `{url}`")
-                st.image(screenshot, use_container_width=True)
-        for url, screenshot in screenshots_mobile:
-            if screenshot:
-                st.markdown(f"**📱 Mobil:** `{url}`")
-                st.image(screenshot, width=390)
-
-    with st.expander("🔍 Extrahované SEO dáta", expanded=False):
-        for data in seo_data_list:
-            st.json(data)
-
+def get_pagespeed_data(url, strategy="mobile"):
+    """Získa dáta z PageSpeed Insights API (zadarmo, bez kľúča)."""
+    api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+    params = {
+        "url": url,
+        "strategy": strategy,
+        "category": ["performance", "accessibility", "best-practices", "seo"],
+    }
     try:
-        vysledok = analyzuj_gemini(
-            api_key, screenshots_desktop, screenshots_mobile,
-            seo_data_list, hlavna_url, podstranky
-        )
+        resp = requests.get(api_url, params=params, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
 
-        st.divider()
-        st.markdown("## 📊 Výsledky auditu")
-        st.markdown(vysledok)
+        categories = data.get("lighthouseResult", {}).get("categories", {})
+        scores = {}
+        for key, val in categories.items():
+            scores[key] = round(val.get("score", 0) * 100)
 
-        # EXPORT
-        st.divider()
-        st.markdown("#### 📥 Stiahnuť report")
+        audits = data.get("lighthouseResult", {}).get("audits", {})
+        metrics = {}
+        for metric_key in [
+            "first-contentful-paint",
+            "largest-contentful-paint",
+            "total-blocking-time",
+            "cumulative-layout-shift",
+            "speed-index",
+            "interactive",
+        ]:
+            if metric_key in audits:
+                metrics[metric_key] = {
+                    "displayValue": audits[metric_key].get("displayValue", ""),
+                    "score": audits[metric_key].get("score", 0),
+                }
 
-        datum = datetime.now().strftime("%Y-%m-%d")
-        nazov_eshopu = (
-            hlavna_url.split("//")[1].split("/")[0].replace("www.", "")
-        )
+        # Screenshot z PageSpeed
+        screenshot_data = None
+        screenshot_audit = audits.get("final-screenshot", {})
+        if screenshot_audit:
+            details = screenshot_audit.get("details", {})
+            screenshot_data = details.get("data", None)
 
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.download_button(
-                "📄 Markdown (.md)",
-                data=vysledok,
-                file_name=f"audit_{nazov_eshopu}_{datum}.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
-
-        html_report = f"""<!DOCTYPE html>
-<html lang="sk">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Audit {nazov_eshopu} - {datum}</title>
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    line-height: 1.7; color: #1a1a1a;
-    background: #f8f9fa; padding: 0;
-}}
-.header {{
-    background: linear-gradient(135deg, #1e3a5f, #2d5a87);
-    color: white; padding: 40px; text-align: center;
-}}
-.header h1 {{ font-size: 26px; margin-bottom: 8px; }}
-.header p {{ opacity: 0.85; font-size: 15px; }}
-.container {{ max-width: 900px; margin: 30px auto; padding: 0 20px; }}
-.content {{
-    background: white; border-radius: 12px;
-    padding: 40px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
-}}
-h2 {{
-    color: #1e3a5f; border-bottom: 2px solid #e8ecf1;
-    padding-bottom: 8px; margin: 32px 0 16px; font-size: 20px;
-}}
-h3 {{ color: #2d5a87; margin: 24px 0 12px; font-size: 17px; }}
-code {{
-    background: #f0f4f8; padding: 2px 8px;
-    border-radius: 4px; font-size: 14px;
-}}
-pre {{
-    background: #1e1e1e; color: #d4d4d4;
-    padding: 16px; border-radius: 8px;
-    overflow-x: auto; font-size: 13px;
-}}
-ul, ol {{ padding-left: 24px; margin: 8px 0; }}
-li {{ margin: 4px 0; }}
-.footer {{
-    text-align: center; padding: 24px;
-    color: #888; font-size: 13px;
-}}
-</style>
-</head>
-<body>
-<div class="header">
-    <h1>🔍 E-shop Audit Report</h1>
-    <p>{nazov_eshopu} &bull; {datum}</p>
-</div>
-<div class="container">
-    <div class="content">{markdown_to_html(vysledok)}</div>
-</div>
-<div class="footer">Vygenerované pomocou E-shop Audit Tool</div>
-</body>
-</html>"""
-
-        with col2:
-            st.download_button(
-                "🌐 HTML report",
-                data=html_report,
-                file_name=f"audit_{nazov_eshopu}_{datum}.html",
-                mime="text/html",
-                use_container_width=True
-            )
-
-        status.text("✅ Audit dokončený!")
-
+        return {
+            "strategy": strategy,
+            "scores": scores,
+            "metrics": metrics,
+            "screenshot_base64": screenshot_data,
+        }
     except Exception as e:
-        st.error(f"❌ Chyba pri analýze: {e}")
+        return {"strategy": strategy, "error": str(e)}
 
-st.divider()
-st.caption("🛠️ E-shop Audit Tool | Playwright + Gemini AI + Streamlit")
+
+def run_audit_for_url(url):
+    """Kompletný audit jednej URL – HTML analýza + PageSpeed."""
+    html = fetch_html(url)
+    if html is None:
+        return {"url": url, "error": "Nepodarilo sa stiahnuť stránku"}
+
+    seo_data = analyze_html(url, html)
+
+    ps_mobile = get_pagespeed_data(url, "mobile")
+    ps_desktop = get_pagespeed_data(url, "desktop")
+
+    return {
+        "seo": seo_data,
+        "pagespeed_mobile": ps_mobile,
+        "pagespeed_desktop": ps_desktop,
+    }
+
+
+def generate_gemini_report(gemini_key, all_results, homepage_url):
+    """Vygeneruje audit report cez Gemini."""
+    genai.configure(api_key=gemini_key)
+
+    # Odstráň screenshot base64 z promptu (príliš veľké)
+    results_for_prompt = []
+    for r in all_results:
+        entry = dict(r)
+        if "pagespeed_mobile" in entry and entry["pagespeed_mobile"].get("screenshot_base64"):
+            entry["pagespeed_mobile"] = {
+                k: v
+                for k, v in entry["pagespeed_mobile"].items()
+                if k != "screenshot_base64"
+            }
+        if "pagespeed_desktop" in entry and entry["pagespeed_desktop"].get("screenshot_base64"):
+            entry["pagespeed_desktop"] = {
+                k: v
+                for k, v in entry["pagespeed_desktop"].items()
+                if k != "screenshot_base64"
+            }
+        results_for_prompt.append(entry)
+
+    prompt = f"""Si expert na UX, SEO a konverzné optimalizácie e-shopov.
+
+Dostal si dáta z auditu e-shopu {homepage_url}. Na základe týchto dát vytvor KOMPLETNÝ PROFESIONÁLNY AUDIT REPORT v slovenčine.
+
+DÁTA Z AUDITU:
+{json.dumps(results_for_prompt, indent=2, ensure_ascii=False)}
+
+ŠTRUKTÚRA REPORTU:
+
+## 📊 Celkové zhrnutie
+- Celkové hodnotenie e-shopu (1-10)
+- Top 3 silné stránky
+- Top 3 kritické problémy
+
+## 🔍 SEO Audit
+Pre každú stránku:
+- Title tag – dĺžka, kvalita, odporúčanie
+- Meta description – dĺžka, kvalita, odporúčanie
+- Heading štruktúra – správnosť hierarchie
+- Obrázky bez alt textu – počet a dopad
+- Interné/externé linky
+- Štruktúrované dáta
+- Canonical URL
+
+## ⚡ Výkon a rýchlosť
+- Core Web Vitals (LCP, CLS, TBT)
+- Performance score mobile vs desktop
+- Konkrétne odporúčania na zrýchlenie
+
+## 📱 UX a mobilná verzia
+- Viewport nastavenie
+- Mobile vs desktop skóre
+- Accessibility skóre
+- Odporúčania na zlepšenie UX
+
+## 🛒 Konverzné odporúčania
+- Analýza formulárov a vyhľadávania
+- CTA prvky
+- Nákupný proces
+- Trust signály
+
+## ✅ Akčný plán
+Zoraď odporúčania podľa priority (vysoká/stredná/nízka) a odhadovaného dopadu.
+Použi formát tabuľky: | Priorita | Odporúčanie | Dopad | Náročnosť |
+
+Buď konkrétny, uvádzaj presné hodnoty z dát. Nepoužívaj všeobecné frázy."""
+
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(prompt)
+    return response.text
+
+
+# ── Hlavná logika ──
+
+if st.button("🔍 Spustiť audit", type="primary", use_container_width=True):
+    if not gemini_key:
+        st.error("Zadaj Gemini API kľúč.")
+        st.stop()
+    if not homepage_url:
+        st.error("Zadaj URL e-shopu.")
+        st.stop()
+
+    # Zozbieraj URL
+    urls = [homepage_url.strip().rstrip("/") + "/"]
+    for line in subpages_text.strip().split("\n"):
+        normalized = normalize_url(homepage_url, line)
+        if normalized and normalized not in urls:
+            urls.append(normalized)
+
+    urls = urls[:11]  # max 11 stránok
+
+    st.info(f"📄 Auditujem {len(urls)} stránok...")
+
+    # Audit každej stránky
+    all_results = []
+    progress_bar = st.progress(0)
+
+    for i, url in enumerate(urls):
+        st.write(f"⏳ Analyzujem: `{url}`")
+        result = run_audit_for_url(url)
+        all_results.append(result)
+        progress_bar.progress((i + 1) / len(urls))
+
+    progress_bar.empty()
+
+    # ── Screenshoty stránok ──
+    st.subheader("📸 Screenshoty stránok")
+
+    for result in all_results:
+        if "error" in result:
+            continue
+        url = result["seo"]["url"]
+
+        # Screenshot z PageSpeed API (ak existuje)
+        for variant in ["pagespeed_mobile", "pagespeed_desktop"]:
+            ps = result.get(variant, {})
+            screenshot = ps.get("screenshot_base64")
+            if screenshot and screenshot.startswith("data:image"):
+                try:
+                    img_data = screenshot.split(",")[1]
+                    img_bytes = base64.b64decode(img_data)
+                    img = Image.open(BytesIO(img_bytes))
+                    label = "📱 Mobile" if "mobile" in variant else "🖥️ Desktop"
+                    st.markdown(f"**{label}: {url}**")
+                    st.image(img, use_container_width=True)
+                except Exception:
+                    pass
+
+        # Záložný screenshot cez thum.io
+        st.markdown(f"**🖼️ Náhľad: {url}**")
+        st.image(get_screenshot_url(url), use_container_width=True)
+
+    # ── PageSpeed skóre ──
+    st.subheader("⚡ PageSpeed skóre")
+    for result in all_results:
+        if "error" in result:
+            st.warning(f"❌ {result.get('url', 'N/A')}: {result['error']}")
+            continue
+        url = result["seo"]["url"]
+        col1, col2 = st.columns(2)
+        for col, variant, label in [
+            (col1, "pagespeed_mobile", "📱 Mobile"),
+            (col2, "pagespeed_desktop", "🖥️ Desktop"),
+        ]:
+            ps = result.get(variant, {})
+            if "error" in ps:
+                col.warning(f"{label}: Chyba – {ps['error']}")
+            else:
+                scores = ps.get("scores", {})
+                col.markdown(f"**{label}: {url}**")
+                score_cols = col.columns(4)
+                for j, (key, name) in enumerate(
+                    [
+                        ("performance", "Výkon"),
+                        ("accessibility", "Prístupnosť"),
+                        ("best-practices", "Best Practices"),
+                        ("seo", "SEO"),
+                    ]
+                ):
+                    score = scores.get(key, "–")
+                    if isinstance(score, int) and score >= 90:
+                        color = "🟢"
+                    elif isinstance(score, int) and score >= 50:
+                        color = "🟡"
+                    else:
+                        color = "🔴"
+                    score_cols[j].metric(name, f"{color} {score}")
+
+    # ── AI Report ──
+    st.subheader("📝 Generujem AI audit report...")
+    with st.spinner("Gemini analyzuje dáta a píše report..."):
+        try:
+            report = generate_gemini_report(gemini_key, all_results, homepage_url)
+            st.markdown("---")
+            st.markdown(report)
+
+            st.download_button(
+                label="📥 Stiahnuť report ako TXT",
+                data=report,
+                file_name="eshop_audit_report.txt",
+                mime="text/plain",
+            )
+        except Exception as e:
+            st.error(f"Chyba pri generovaní reportu: {e}")
