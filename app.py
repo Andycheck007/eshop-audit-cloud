@@ -5,6 +5,9 @@ from urllib.parse import urljoin, urlparse
 import json
 import base64
 import time
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from PIL import Image
 import google.generativeai as genai
@@ -17,6 +20,11 @@ except ImportError:
 
 # JS knižnica na kontrolu prístupnosti (WCAG), nahráva sa priamo do stránky v prehliadači
 AXE_CORE_CDN = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"
+
+# Streamlit Cloud beží vo vnútri asyncio event loopu (kvôli websocketom), a Playwright Sync API
+# v takom vlákne zlyhá s chybou "Sync API inside the asyncio loop". Riešenie: spúšťať Playwright
+# vždy v samostatnom vlákne bez bežiaceho event loopu – presne na to slúži tento worker.
+_playwright_executor = ThreadPoolExecutor(max_workers=1)
 
 # ── Konfigurácia stránky ──
 st.set_page_config(page_title="E-shop Audit Tool", page_icon="🔍", layout="wide")
@@ -31,10 +39,10 @@ st.markdown(
 gemini_key = st.text_input("🔑 Gemini API kľúč", type="password")
 gemini_model_name = st.text_input(
     "🤖 Gemini model",
-    value="gemini-2.5-flash",
-    help="Google občas staré modely vypína (napr. gemini-2.0-flash prestal fungovať 1.6.2026). "
-         "Ak dostaneš chybu '404 model not found', over si aktuálny názov modelu na "
-         "https://ai.google.dev/gemini-api/docs/models a vlož ho sem.",
+    value="gemini-3.5-flash",
+    help="Google vypína konkrétne verzie modelov prekvapivo často. Ak dostaneš chybu "
+         "'404 model not found', skús alias 'gemini-flash-latest' (ten sa aktualizuje sám), "
+         "alebo si over aktuálny zoznam na https://ai.google.dev/gemini-api/docs/models.",
 )
 homepage_url = st.text_input("🏠 URL hlavnej stránky e-shopu", placeholder="https://www.example.sk/")
 
@@ -103,88 +111,102 @@ def fetch_html(url, timeout=15):
         return None, {}
 
 
-@st.cache_resource(show_spinner=False)
-def get_playwright_browser():
-    """
-    Spustí headless Chromium raz a znovu ho použije pre všetky stránky v tomto behu.
-    Ak binárka Chromium ešte nie je stiahnutá (bežné pri prvom deploy na Streamlit Cloud),
-    stiahne ju automaticky – toto trvá len pri úplne prvom spustení appky.
-    """
-    pw = sync_playwright().start()
+_chromium_install_checked = False
+
+
+def _ensure_chromium_installed():
+    """Skontroluje/nainštaluje Chromium binárku pre Playwright. Volá sa len raz za beh appky."""
+    global _chromium_install_checked
+    if _chromium_install_checked:
+        return
+    _chromium_install_checked = True
     try:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            browser.close()
     except Exception as e:
         if "Executable doesn't exist" in str(e) or "playwright install" in str(e).lower():
-            subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium"],
-                check=True,
-            )
-            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
         else:
             raise
-    return pw, browser
+
+
+def _render_page_sync(url, timeout_ms=20000):
+    """
+    Skutočná Playwright logika – MUSÍ bežať v samostatnom vlákne bez asyncio event loopu.
+    Volané výhradne cez fetch_rendered_page(), nikdy priamo z hlavného vlákna Streamlitu.
+    """
+    _ensure_chromium_installed()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        try:
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+            page.set_default_timeout(timeout_ms)
+
+            response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass  # SPA s nekonečným pollingom – v poriadku, ideme ďalej
+
+            html = page.content()
+            headers = dict(response.headers) if response else {}
+
+            screenshot_bytes = None
+            try:
+                screenshot_bytes = page.screenshot(full_page=False)
+            except Exception:
+                pass
+
+            accessibility_issues = []
+            try:
+                page.add_script_tag(url=AXE_CORE_CDN)
+                axe_result = page.evaluate("async () => { return await axe.run(); }")
+                for violation in axe_result.get("violations", []):
+                    accessibility_issues.append({
+                        "id": violation.get("id"),
+                        "impact": violation.get("impact"),
+                        "description": violation.get("description"),
+                        "help": violation.get("help"),
+                        "nodes_affected": len(violation.get("nodes", [])),
+                    })
+            except Exception:
+                pass  # axe-core zlyhal (napr. CSP blokuje externý script) – audit pokračuje bez neho
+
+            context.close()
+
+            return {
+                "html": html,
+                "headers": headers,
+                "screenshot_bytes": screenshot_bytes,
+                "accessibility_issues": accessibility_issues,
+            }
+        finally:
+            browser.close()
 
 
 def fetch_rendered_page(url, timeout_ms=20000):
     """
     Načíta stránku cez skutočný prehliadač (Playwright) – vidí obsah dorenderovaný JavaScriptom.
-    Vráti: html, screenshot (bytes), response headers, zoznam accessibility chýb (axe-core).
-    Ak Playwright zlyhá alebo nie je dostupný, vráti None a volajúci má spraviť fallback na fetch_html.
+    Spúšťa sa v samostatnom vlákne, aby nekolidovalo s asyncio event loopom, v ktorom beží
+    Streamlit Cloud (Playwright Sync API inak v takom vlákne zlyhá).
+    Vráti: html, screenshot (bytes), response headers, zoznam accessibility chýb (axe-core),
+    alebo {"error": "..."} ak zlyhá – volajúci má vtedy spraviť fallback na fetch_html.
     """
     if not PLAYWRIGHT_AVAILABLE:
-        return None
+        return {"error": "Playwright balíček nie je v tomto prostredí nainštalovaný."}
 
     try:
-        pw, browser = get_playwright_browser()
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-        page.set_default_timeout(timeout_ms)
-
-        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        # Počkaj chvíľu na dobehnutie JS renderovania (lazy-load, SPA), ale nečakaj donekonečna
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass  # stránka má nekonečný polling/websocket – to je v poriadku, ideme ďalej
-
-        html = page.content()
-        headers = dict(response.headers) if response else {}
-
-        screenshot_bytes = None
-        try:
-            screenshot_bytes = page.screenshot(full_page=False)
-        except Exception:
-            pass
-
-        accessibility_issues = []
-        try:
-            page.add_script_tag(url=AXE_CORE_CDN)
-            axe_result = page.evaluate("async () => { return await axe.run(); }")
-            for violation in axe_result.get("violations", []):
-                accessibility_issues.append({
-                    "id": violation.get("id"),
-                    "impact": violation.get("impact"),
-                    "description": violation.get("description"),
-                    "help": violation.get("help"),
-                    "nodes_affected": len(violation.get("nodes", [])),
-                })
-        except Exception:
-            pass  # axe-core zlyhal (napr. CSP blokuje externý script) – audit pokračuje bez neho
-
-        context.close()
-
-        return {
-            "html": html,
-            "headers": headers,
-            "screenshot_bytes": screenshot_bytes,
-            "accessibility_issues": accessibility_issues,
-        }
+        future = _playwright_executor.submit(_render_page_sync, url, timeout_ms)
+        return future.result(timeout=(timeout_ms / 1000) + 20)
     except Exception as e:
         return {"error": str(e)}
 
@@ -437,7 +459,7 @@ def run_audit_for_url(url, pagespeed_key=None, run_desktop=False, delay_between_
     return result
 
 
-def generate_gemini_report(gemini_key, all_results, homepage_url, model_name="gemini-2.5-flash"):
+def generate_gemini_report(gemini_key, all_results, homepage_url, model_name="gemini-3.5-flash"):
     """Vygeneruje audit report cez Gemini."""
     clean_key = gemini_key.strip() if gemini_key else ""
     if not clean_key:
@@ -528,9 +550,9 @@ Buď konkrétny, uvádzaj presné hodnoty z dát. Nepoužívaj všeobecné fráz
         if "404" in err_msg or "is no longer available" in err_msg or "not found" in err_msg.lower():
             raise RuntimeError(
                 f"Model '{model_name}' už nie je dostupný (Google ho vypol). "
-                "Over si aktuálny zoznam modelov na https://ai.google.dev/gemini-api/docs/models "
-                "a zmeň názov modelu v poli '🤖 Gemini model' vyššie, napr. na 'gemini-2.5-flash' "
-                "alebo 'gemini-2.5-flash-lite'."
+                "Skús namiesto neho alias 'gemini-flash-latest' (aktualizuje sa automaticky), "
+                "alebo si over aktuálny zoznam na https://ai.google.dev/gemini-api/docs/models "
+                "a zmeň názov modelu v poli '🤖 Gemini model' vyššie."
             ) from e
         raise
 
