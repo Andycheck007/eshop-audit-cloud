@@ -29,6 +29,13 @@ st.markdown(
 
 # ── Vstupy ──
 gemini_key = st.text_input("🔑 Gemini API kľúč", type="password")
+gemini_model_name = st.text_input(
+    "🤖 Gemini model",
+    value="gemini-2.5-flash",
+    help="Google občas staré modely vypína (napr. gemini-2.0-flash prestal fungovať 1.6.2026). "
+         "Ak dostaneš chybu '404 model not found', over si aktuálny názov modelu na "
+         "https://ai.google.dev/gemini-api/docs/models a vlož ho sem.",
+)
 homepage_url = st.text_input("🏠 URL hlavnej stránky e-shopu", placeholder="https://www.example.sk/")
 
 pagespeed_key = st.text_input(
@@ -383,6 +390,7 @@ def run_audit_for_url(url, pagespeed_key=None, run_desktop=False, delay_between_
     accessibility_issues = []
     response_headers = {}
     render_method = "requests"  # pre transparentnosť v reporte, ktorou metódou sa stránka načítala
+    playwright_error = None
 
     if use_playwright and PLAYWRIGHT_AVAILABLE:
         rendered = fetch_rendered_page(url)
@@ -392,6 +400,10 @@ def run_audit_for_url(url, pagespeed_key=None, run_desktop=False, delay_between_
             accessibility_issues = rendered.get("accessibility_issues", [])
             response_headers = rendered.get("headers", {})
             render_method = "playwright"
+        elif rendered:
+            playwright_error = rendered.get("error")
+    elif use_playwright and not PLAYWRIGHT_AVAILABLE:
+        playwright_error = "Playwright balíček nie je v tomto prostredí nainštalovaný."
 
     if html is None:
         # Fallback – buď Playwright nie je dostupný, alebo zlyhal na tejto URL
@@ -414,6 +426,7 @@ def run_audit_for_url(url, pagespeed_key=None, run_desktop=False, delay_between_
     result = {
         "seo": seo_data,
         "render_method": render_method,
+        "playwright_error": playwright_error,
         "accessibility_issues": accessibility_issues,
         "security_checks": security_checks,
         "own_screenshot_bytes": own_screenshot,
@@ -424,7 +437,7 @@ def run_audit_for_url(url, pagespeed_key=None, run_desktop=False, delay_between_
     return result
 
 
-def generate_gemini_report(gemini_key, all_results, homepage_url):
+def generate_gemini_report(gemini_key, all_results, homepage_url, model_name="gemini-2.5-flash"):
     """Vygeneruje audit report cez Gemini."""
     clean_key = gemini_key.strip() if gemini_key else ""
     if not clean_key:
@@ -498,7 +511,7 @@ Použi formát tabuľky: | Priorita | Odporúčanie | Dopad | Náročnosť |
 Buď konkrétny, uvádzaj presné hodnoty z dát. Nepoužívaj všeobecné frázy."""
 
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(model_name)
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
@@ -511,6 +524,13 @@ Buď konkrétny, uvádzaj presné hodnoty z dát. Nepoužívaj všeobecné fráz
                 "s obmedzeniami, ktorý blokuje server-side volania)\n"
                 "3) Že v Google Cloud projekte je povolené 'Generative Language API'\n"
                 "4) Že kľúč nemá nastavené HTTP referrer restrictions (tie blokujú volania zo Streamlit servera)"
+            ) from e
+        if "404" in err_msg or "is no longer available" in err_msg or "not found" in err_msg.lower():
+            raise RuntimeError(
+                f"Model '{model_name}' už nie je dostupný (Google ho vypol). "
+                "Over si aktuálny zoznam modelov na https://ai.google.dev/gemini-api/docs/models "
+                "a zmeň názov modelu v poli '🤖 Gemini model' vyššie, napr. na 'gemini-2.5-flash' "
+                "alebo 'gemini-2.5-flash-lite'."
             ) from e
         raise
 
@@ -645,6 +665,9 @@ if st.button("🔍 Spustiť audit", type="primary", use_container_width=True):
             if not issues:
                 if result.get("render_method") == "playwright":
                     st.success("Žiadne axe-core violácie nenájdené.")
+                elif result.get("playwright_error"):
+                    st.error(f"Playwright zlyhal: {result['playwright_error']}")
+                    st.caption("Použil sa fallback (obyčajný HTTP request) – accessibility kontrola nebola spustená.")
                 else:
                     st.caption("Accessibility kontrola vyžaduje Playwright renderovanie (bolo vypnuté/nedostupné).")
             else:
@@ -672,7 +695,7 @@ if st.button("🔍 Spustiť audit", type="primary", use_container_width=True):
     st.subheader("📝 Generujem AI audit report...")
     with st.spinner("Gemini analyzuje dáta a píše report..."):
         try:
-            report = generate_gemini_report(gemini_key, all_results, homepage_url)
+            report = generate_gemini_report(gemini_key, all_results, homepage_url, model_name=gemini_model_name)
             st.markdown("---")
             st.markdown(report)
 
