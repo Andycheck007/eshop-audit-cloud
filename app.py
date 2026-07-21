@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import json
 import base64
+import time
 from io import BytesIO
 from PIL import Image
 import google.generativeai as genai
@@ -20,20 +21,24 @@ st.markdown(
 # ── Vstupy ──
 gemini_key = st.text_input("🔑 Gemini API kľúč", type="password")
 homepage_url = st.text_input("🏠 URL hlavnej stránky e-shopu", placeholder="https://www.example.sk/")
+pagespeed_key = st.text_input(
+    "🔑 Google PageSpeed API kľúč (voliteľné – zlepší spoľahlivosť)",
+    type="password",
+    help="Získaš ho zadarmo na https://console.cloud.google.com/apis/credentials",
+)
 
-st.subheader("📄 Podstránky na audit (max 10)")
-st.caption("Zadaj relatívne cesty (napr. /produkty/) alebo plné URL, každú na nový riadok")
+st.subheader("📄 Podstránky na audit (max 5)")
+st.caption("Zadaj relatívne cesty alebo plné URL, každú na nový riadok. Menej stránok = menej chýb s rate limitom.")
 subpages_text = st.text_area(
     "Podstránky",
-    value="/kategoria/\n/produkt/\n/kosik/\n/kontakt/\n/blog/",
-    height=150,
+    value="/kategoria/\n/produkt/\n/kontakt/",
+    height=120,
 )
 
 
 # ── Pomocné funkcie ──
 
 def normalize_url(base, path):
-    """Spojí base URL a relatívnu cestu."""
     path = path.strip()
     if not path:
         return None
@@ -43,7 +48,6 @@ def normalize_url(base, path):
 
 
 def fetch_html(url, timeout=15):
-    """Stiahne HTML stránky."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,12 +60,11 @@ def fetch_html(url, timeout=15):
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding
         return resp.text
-    except Exception as e:
+    except Exception:
         return None
 
 
 def analyze_html(url, html):
-    """Extrahuje SEO a štruktúrne dáta z HTML."""
     soup = BeautifulSoup(html, "html.parser")
 
     title_tag = soup.find("title")
@@ -162,21 +165,21 @@ def analyze_html(url, html):
 
 
 def get_screenshot_url(url):
-    """Vráti URL screenshotu cez bezplatnú API službu."""
-    # Používame Google PageSpeed screenshot alebo thum.io
     return f"https://image.thum.io/get/width/1280/crop/800/noanimate/{url}"
 
 
-def get_pagespeed_data(url, strategy="mobile"):
-    """Získa dáta z PageSpeed Insights API (zadarmo, bez kľúča)."""
+def get_pagespeed_data(url, strategy="mobile", api_key=None):
     api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     params = {
         "url": url,
         "strategy": strategy,
         "category": ["performance", "accessibility", "best-practices", "seo"],
     }
+    if api_key:
+        params["key"] = api_key
+
     try:
-        resp = requests.get(api_url, params=params, timeout=90)
+        resp = requests.get(api_url, params=params, timeout=120)
         resp.raise_for_status()
         data = resp.json()
 
@@ -201,7 +204,6 @@ def get_pagespeed_data(url, strategy="mobile"):
                     "score": audits[metric_key].get("score", 0),
                 }
 
-        # Screenshot z PageSpeed
         screenshot_data = None
         screenshot_audit = audits.get("final-screenshot", {})
         if screenshot_audit:
@@ -218,16 +220,19 @@ def get_pagespeed_data(url, strategy="mobile"):
         return {"strategy": strategy, "error": str(e)}
 
 
-def run_audit_for_url(url):
-    """Kompletný audit jednej URL – HTML analýza + PageSpeed."""
+def run_audit_for_url(url, api_key=None, delay=5):
     html = fetch_html(url)
     if html is None:
         return {"url": url, "error": "Nepodarilo sa stiahnuť stránku"}
 
     seo_data = analyze_html(url, html)
 
-    ps_mobile = get_pagespeed_data(url, "mobile")
-    ps_desktop = get_pagespeed_data(url, "desktop")
+    # Pauza pred PageSpeed requestami
+    time.sleep(delay)
+    ps_mobile = get_pagespeed_data(url, "mobile", api_key)
+
+    time.sleep(delay)
+    ps_desktop = get_pagespeed_data(url, "desktop", api_key)
 
     return {
         "seo": seo_data,
@@ -237,24 +242,18 @@ def run_audit_for_url(url):
 
 
 def generate_gemini_report(gemini_key, all_results, homepage_url):
-    """Vygeneruje audit report cez Gemini."""
     genai.configure(api_key=gemini_key)
 
-    # Odstráň screenshot base64 z promptu (príliš veľké)
     results_for_prompt = []
     for r in all_results:
         entry = dict(r)
         if "pagespeed_mobile" in entry and entry["pagespeed_mobile"].get("screenshot_base64"):
             entry["pagespeed_mobile"] = {
-                k: v
-                for k, v in entry["pagespeed_mobile"].items()
-                if k != "screenshot_base64"
+                k: v for k, v in entry["pagespeed_mobile"].items() if k != "screenshot_base64"
             }
         if "pagespeed_desktop" in entry and entry["pagespeed_desktop"].get("screenshot_base64"):
             entry["pagespeed_desktop"] = {
-                k: v
-                for k, v in entry["pagespeed_desktop"].items()
-                if k != "screenshot_base64"
+                k: v for k, v in entry["pagespeed_desktop"].items() if k != "screenshot_base64"
             }
         results_for_prompt.append(entry)
 
@@ -327,31 +326,30 @@ if st.button("🔍 Spustiť audit", type="primary", use_container_width=True):
         if normalized and normalized not in urls:
             urls.append(normalized)
 
-    urls = urls[:11]  # max 11 stránok
+    urls = urls[:6]  # max 6 stránok (1 hlavná + 5 podstránok)
 
-    st.info(f"📄 Auditujem {len(urls)} stránok...")
+    st.info(f"📄 Auditujem {len(urls)} stránok... (medzi PageSpeed requestami je 5s pauza)")
 
-    # Audit každej stránky
     all_results = []
     progress_bar = st.progress(0)
 
+    ps_key = pagespeed_key.strip() if pagespeed_key else None
+
     for i, url in enumerate(urls):
         st.write(f"⏳ Analyzujem: `{url}`")
-        result = run_audit_for_url(url)
+        result = run_audit_for_url(url, api_key=ps_key, delay=5)
         all_results.append(result)
         progress_bar.progress((i + 1) / len(urls))
 
     progress_bar.empty()
 
-    # ── Screenshoty stránok ──
+    # ── Screenshoty ──
     st.subheader("📸 Screenshoty stránok")
-
     for result in all_results:
         if "error" in result:
             continue
         url = result["seo"]["url"]
 
-        # Screenshot z PageSpeed API (ak existuje)
         for variant in ["pagespeed_mobile", "pagespeed_desktop"]:
             ps = result.get(variant, {})
             screenshot = ps.get("screenshot_base64")
@@ -366,7 +364,6 @@ if st.button("🔍 Spustiť audit", type="primary", use_container_width=True):
                 except Exception:
                     pass
 
-        # Záložný screenshot cez thum.io
         st.markdown(f"**🖼️ Náhľad: {url}**")
         st.image(get_screenshot_url(url), use_container_width=True)
 
