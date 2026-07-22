@@ -16,6 +16,8 @@ import markdown2
 from xhtml2pdf import pisa
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+import tempfile
+from fonts_data import DEJAVU_SANS_REGULAR_B64, DEJAVU_SANS_BOLD_B64
 
 try:
     from playwright.sync_api import sync_playwright
@@ -123,23 +125,35 @@ subpages_text = st.text_area(
 
 # ── Pomocné funkcie ──
 
-_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _dejavu_registered = False
 
 
 def _register_unicode_font():
     """
     Zaregistruje DejaVu Sans (podporuje slovenskú diakritiku – č, š, ľ, ť, ž...).
-    Bez tohto xhtml2pdf použije predvolený Helvetica font, ktorý diakritiku
-    nevykreslí (zobrazí namiesto nej čierne štvorčeky).
+    Font je zabudovaný priamo v kóde (fonts_data.py, base64), takže nezávisí od
+    toho, či sa samostatný .ttf súbor podarilo správne nahrať na GitHub – binárne
+    súbory sa cez webové rozhranie GitHubu občas nenahrajú spoľahlivo.
+    Bez tohto fontu by xhtml2pdf použil predvolený Helvetica, ktorý diakritiku
+    vykreslí ako čierne štvorčeky.
     """
     global _dejavu_registered
     if _dejavu_registered:
         return
-    regular_path = os.path.join(_FONTS_DIR, "DejaVuSans.ttf")
-    bold_path = os.path.join(_FONTS_DIR, "DejaVuSans-Bold.ttf")
-    pdfmetrics.registerFont(TTFont("DejaVuSans", regular_path))
-    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_path))
+
+    regular_bytes = base64.b64decode(DEJAVU_SANS_REGULAR_B64)
+    bold_bytes = base64.b64decode(DEJAVU_SANS_BOLD_B64)
+
+    regular_tmp = tempfile.NamedTemporaryFile(suffix=".ttf", delete=False)
+    regular_tmp.write(regular_bytes)
+    regular_tmp.close()
+
+    bold_tmp = tempfile.NamedTemporaryFile(suffix=".ttf", delete=False)
+    bold_tmp.write(bold_bytes)
+    bold_tmp.close()
+
+    pdfmetrics.registerFont(TTFont("DejaVuSans", regular_tmp.name))
+    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_tmp.name))
     pdfmetrics.registerFontFamily(
         "DejaVuSans", normal="DejaVuSans", bold="DejaVuSans-Bold",
         italic="DejaVuSans", boldItalic="DejaVuSans-Bold",
