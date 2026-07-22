@@ -173,7 +173,15 @@ def convert_report_to_pdf(markdown_text, homepage_url):
     pdf.multi_cell(0, 10, f"Audit e-shopu: {homepage_url}")
     pdf.ln(4)
     pdf.set_font("DejaVu", "", 10)
-    pdf.write_html(html_body, table_line_separators=True)
+    # fpdf2 má vstavaný default, že <code>/<pre> tagy (napr. z Gemini markdown so spätnými
+    # úvodzovkami) používajú font "Courier" – ten nepodporuje slovenskú diakritiku vôbec
+    # a pri jej výskyte celé generovanie PDF zlyhá. Prepíšeme to na náš DejaVu font.
+    from fpdf.fonts import FontFace
+    custom_tag_styles = {
+        "code": FontFace(family="DejaVu"),
+        "pre": FontFace(family="DejaVu"),
+    }
+    pdf.write_html(html_body, table_line_separators=True, tag_styles=custom_tag_styles)
 
     pdf_bytes = bytes(pdf.output())
     return pdf_bytes
