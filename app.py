@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from PIL import Image
 import google.generativeai as genai
+import markdown2
+from xhtml2pdf import pisa
 
 try:
     from playwright.sync_api import sync_playwright
@@ -69,19 +71,122 @@ with col_b:
              "Playwright nie je v tomto prostredí dostupný – použije sa jednoduchý HTTP request.",
     )
 
-st.subheader("📄 Podstránky na audit (max 5)")
+st.subheader("📄 Podstránky na audit")
 st.caption(
-    "Zadaj relatívne cesty (napr. /produkty/) alebo plné URL, každú na nový riadok. "
-    "Menej stránok = menej chýb s rate limitom."
+    "Poznámka: Nie je nutné (ani rozumné) auditovať celý e-shop stránku po stránke – "
+    "e-shopy väčšinou používajú jednu šablónu pre všetky produkty/kategórie, takže chyba v šablóne "
+    "sa opakuje na stovkách stránok rovnako. Stačí vybrať zástupcu za každý typ stránky "
+    "(hlavná, kategória, produkt, košík, kontakt, blog)."
 )
+
+col_sm1, col_sm2 = st.columns([1, 2])
+with col_sm1:
+    find_sitemap_clicked = st.button("🔎 Nájsť URL zo sitemap.xml")
+with col_sm2:
+    max_pages = st.slider(
+        "Max. počet podstránok na audit",
+        min_value=1, max_value=20, value=5,
+        help="Vyššie číslo = presnejší obraz o celom e-shope, ale dlhší beh a viac šancí na 429 "
+             "chybu z PageSpeed. Odporúčané: 5-8 (jedna stránka za každý typ šablóny).",
+    )
+
+if find_sitemap_clicked:
+    if not homepage_url:
+        st.warning("Najprv vyplň URL hlavnej stránky e-shopu vyššie.")
+    else:
+        with st.spinner("Hľadám sitemap.xml..."):
+            found_urls = discover_sitemap_urls(homepage_url)
+        if found_urls:
+            st.session_state["sitemap_urls"] = found_urls
+            st.success(f"Našiel som {len(found_urls)} URL v sitemape. Vyber si z nich nižšie.")
+        else:
+            st.warning("Sitemap.xml sa nenašiel alebo je prázdny – vlož podstránky ručne do poľa nižšie.")
+
+default_subpages = "/kategoria/\n/produkt/\n/kosik/\n/kontakt/\n/blog/"
+if "sitemap_urls" in st.session_state:
+    picked = st.multiselect(
+        "Vyber podstránky nájdené v sitemap.xml (odporúčané: 1-2 z každého typu – kategória, produkt, statická stránka)",
+        options=st.session_state["sitemap_urls"],
+        default=st.session_state["sitemap_urls"][:max_pages],
+    )
+    default_subpages = "\n".join(picked)
+
 subpages_text = st.text_area(
-    "Podstránky",
-    value="/kategoria/\n/produkt/\n/kosik/\n/kontakt/\n/blog/",
+    "Podstránky (alebo uprav výber zo sitemap vyššie)",
+    value=default_subpages,
     height=150,
 )
 
 
 # ── Pomocné funkcie ──
+
+def convert_report_to_pdf(markdown_text, homepage_url):
+    """Skonvertuje vygenerovaný markdown report na PDF (bytes) na stiahnutie."""
+    html_body = markdown2.markdown(markdown_text, extras=["tables", "fenced-code-blocks"])
+    html_full = f"""
+    <html>
+    <head>
+    <meta charset="UTF-8">
+    <style>
+        @page {{ size: A4; margin: 2cm; }}
+        body {{ font-family: Helvetica, sans-serif; font-size: 10pt; line-height: 1.5; color: #222; }}
+        h1 {{ font-size: 18pt; color: #111; border-bottom: 2px solid #444; padding-bottom: 6px; }}
+        h2 {{ font-size: 14pt; color: #222; margin-top: 20px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
+        h3 {{ font-size: 12pt; color: #333; margin-top: 14px; }}
+        table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+        th, td {{ border: 1px solid #999; padding: 6px 8px; font-size: 9pt; text-align: left; }}
+        th {{ background-color: #eee; }}
+        code {{ background-color: #f2f2f2; padding: 1px 4px; }}
+    </style>
+    </head>
+    <body>
+        <h1>Audit e-shopu: {homepage_url}</h1>
+        {html_body}
+    </body>
+    </html>
+    """
+    pdf_buffer = BytesIO()
+    pisa.CreatePDF(html_full, dest=pdf_buffer, encoding="UTF-8")
+    pdf_buffer.seek(0)
+    return pdf_buffer.getvalue()
+
+
+def discover_sitemap_urls(homepage_url, max_urls=200):
+    """
+    Skúsi nájsť sitemap.xml a vytiahnuť z neho zoznam URL adries e-shopu.
+    Vráti zoznam URL (bez homepage), alebo prázdny zoznam ak sitemap neexistuje/zlyhá.
+    """
+    candidates = [
+        urljoin(homepage_url, "/sitemap.xml"),
+        urljoin(homepage_url, "/sitemap_index.xml"),
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AuditBot/1.0)"}
+    found = []
+    for sitemap_url in candidates:
+        try:
+            resp = requests.get(sitemap_url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "xml")
+            locs = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
+            # Ak je to sitemap index (odkazuje na ďalšie sitemapy), skús prvú z nich
+            if locs and any(l.endswith(".xml") for l in locs):
+                sub_sitemaps = [l for l in locs if l.endswith(".xml")][:3]
+                for sub in sub_sitemaps:
+                    try:
+                        sub_resp = requests.get(sub, headers=headers, timeout=10)
+                        sub_soup = BeautifulSoup(sub_resp.text, "xml")
+                        found.extend([loc.get_text(strip=True) for loc in sub_soup.find_all("loc")])
+                    except Exception:
+                        continue
+            else:
+                found.extend(locs)
+            if found:
+                break
+        except Exception:
+            continue
+    return found[:max_urls]
+
 
 def normalize_url(base, path):
     """Spojí base URL a relatívnu cestu."""
@@ -574,7 +679,7 @@ if st.button("🔍 Spustiť audit", type="primary", use_container_width=True):
         if normalized and normalized not in urls:
             urls.append(normalized)
 
-    urls = urls[:6]  # max 6 stránok (homepage + 5 podstránok) – menej = menej 429 chýb
+    urls = urls[: max_pages + 1]  # +1 pre homepage, zvyšok podľa voľby v UI
 
     st.info(
         f"📄 Auditujem {len(urls)} stránok "
@@ -721,11 +826,24 @@ if st.button("🔍 Spustiť audit", type="primary", use_container_width=True):
             st.markdown("---")
             st.markdown(report)
 
-            st.download_button(
-                label="📥 Stiahnuť report ako TXT",
-                data=report,
-                file_name="eshop_audit_report.txt",
-                mime="text/plain",
-            )
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                st.download_button(
+                    label="📥 Stiahnuť report ako TXT",
+                    data=report,
+                    file_name="eshop_audit_report.txt",
+                    mime="text/plain",
+                )
+            with dl_col2:
+                try:
+                    pdf_bytes = convert_report_to_pdf(report, homepage_url)
+                    st.download_button(
+                        label="📄 Stiahnuť report ako PDF",
+                        data=pdf_bytes,
+                        file_name="eshop_audit_report.pdf",
+                        mime="application/pdf",
+                    )
+                except Exception as pdf_err:
+                    st.warning(f"PDF export zlyhal ({pdf_err}), použi prosím TXT verziu.")
         except Exception as e:
             st.error(f"Chyba pri generovaní reportu: {e}")
