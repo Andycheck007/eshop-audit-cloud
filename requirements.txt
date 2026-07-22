@@ -6,5 +6,4 @@ Pillow
 google-generativeai
 playwright
 markdown2
-xhtml2pdf
-reportlab
+fpdf2
