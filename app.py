@@ -13,9 +13,7 @@ from io import BytesIO
 from PIL import Image
 import google.generativeai as genai
 import markdown2
-from xhtml2pdf import pisa
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from fpdf import FPDF
 import tempfile
 from fonts_data import DEJAVU_SANS_REGULAR_B64, DEJAVU_SANS_BOLD_B64
 
@@ -125,21 +123,17 @@ subpages_text = st.text_area(
 
 # ── Pomocné funkcie ──
 
-_dejavu_registered = False
+_dejavu_font_paths = None
 
 
-def _register_unicode_font():
+def _get_dejavu_font_paths():
     """
-    Zaregistruje DejaVu Sans (podporuje slovenskú diakritiku – č, š, ľ, ť, ž...).
-    Font je zabudovaný priamo v kóde (fonts_data.py, base64), takže nezávisí od
-    toho, či sa samostatný .ttf súbor podarilo správne nahrať na GitHub – binárne
-    súbory sa cez webové rozhranie GitHubu občas nenahrajú spoľahlivo.
-    Bez tohto fontu by xhtml2pdf použil predvolený Helvetica, ktorý diakritiku
-    vykreslí ako čierne štvorčeky.
+    Dekóduje DejaVu Sans fonty z base64 (zabudované v fonts_data.py) do dočasných
+    súborov a vráti ich cesty. Volá sa len raz, cesty sa cache-ujú na ďalšie použitie.
     """
-    global _dejavu_registered
-    if _dejavu_registered:
-        return
+    global _dejavu_font_paths
+    if _dejavu_font_paths is not None:
+        return _dejavu_font_paths
 
     regular_bytes = base64.b64decode(DEJAVU_SANS_REGULAR_B64)
     bold_bytes = base64.b64decode(DEJAVU_SANS_BOLD_B64)
@@ -152,46 +146,37 @@ def _register_unicode_font():
     bold_tmp.write(bold_bytes)
     bold_tmp.close()
 
-    pdfmetrics.registerFont(TTFont("DejaVuSans", regular_tmp.name))
-    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_tmp.name))
-    pdfmetrics.registerFontFamily(
-        "DejaVuSans", normal="DejaVuSans", bold="DejaVuSans-Bold",
-        italic="DejaVuSans", boldItalic="DejaVuSans-Bold",
-    )
-    _dejavu_registered = True
+    _dejavu_font_paths = (regular_tmp.name, bold_tmp.name)
+    return _dejavu_font_paths
 
 
 def convert_report_to_pdf(markdown_text, homepage_url):
-    """Skonvertuje vygenerovaný markdown report na PDF (bytes) na stiahnutie."""
-    _register_unicode_font()
-    html_body = markdown2.markdown(markdown_text, extras=["tables", "fenced-code-blocks"])
-    html_full = f"""
-    <html>
-    <head>
-    <meta charset="UTF-8">
-    <style>
-        @page {{ size: A4; margin: 2cm; }}
-        body {{ font-family: "DejaVuSans"; font-size: 10pt; line-height: 1.5; color: #222; }}
-        h1 {{ font-family: "DejaVuSans-Bold"; font-size: 18pt; color: #111; border-bottom: 2px solid #444; padding-bottom: 6px; }}
-        h2 {{ font-family: "DejaVuSans-Bold"; font-size: 14pt; color: #222; margin-top: 20px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
-        h3 {{ font-family: "DejaVuSans-Bold"; font-size: 12pt; color: #333; margin-top: 14px; }}
-        b, strong {{ font-family: "DejaVuSans-Bold"; }}
-        table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
-        th, td {{ border: 1px solid #999; padding: 6px 8px; font-size: 9pt; text-align: left; font-family: "DejaVuSans"; }}
-        th {{ background-color: #eee; font-family: "DejaVuSans-Bold"; }}
-        code {{ background-color: #f2f2f2; padding: 1px 4px; }}
-    </style>
-    </head>
-    <body>
-        <h1>Audit e-shopu: {homepage_url}</h1>
-        {html_body}
-    </body>
-    </html>
     """
-    pdf_buffer = BytesIO()
-    pisa.CreatePDF(html_full, dest=pdf_buffer, encoding="UTF-8")
-    pdf_buffer.seek(0)
-    return pdf_buffer.getvalue()
+    Skonvertuje vygenerovaný markdown report na PDF (bytes) na stiahnutie.
+    Používa fpdf2 (nie xhtml2pdf) – xhtml2pdf/reportlab má známy bug pri
+    vkladaní niektorých slovenských znakov (ľ, ť, ď, ň sa vykresľovali ako
+    prázdne štvorčeky, aj keď font tieto znaky obsahoval). fpdf2 má robustnejšie
+    spracovanie TrueType fontov a tento problém nemá (overené testom).
+    """
+    regular_path, bold_path = _get_dejavu_font_paths()
+
+    html_body = markdown2.markdown(markdown_text, extras=["tables", "fenced-code-blocks"])
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.add_font("DejaVu", "", regular_path)
+    pdf.add_font("DejaVu", "B", bold_path)
+    pdf.add_font("DejaVu", "I", regular_path)
+    pdf.add_font("DejaVu", "BI", bold_path)
+    pdf.set_font("DejaVu", "B", 16)
+    pdf.multi_cell(0, 10, f"Audit e-shopu: {homepage_url}")
+    pdf.ln(4)
+    pdf.set_font("DejaVu", "", 10)
+    pdf.write_html(html_body, table_line_separators=True)
+
+    pdf_bytes = bytes(pdf.output())
+    return pdf_bytes
 
 
 def discover_sitemap_urls(homepage_url, max_urls=200):
