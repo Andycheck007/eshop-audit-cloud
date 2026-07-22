@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import os
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import json
@@ -13,6 +14,8 @@ from PIL import Image
 import google.generativeai as genai
 import markdown2
 from xhtml2pdf import pisa
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 try:
     from playwright.sync_api import sync_playwright
@@ -120,8 +123,33 @@ subpages_text = st.text_area(
 
 # ── Pomocné funkcie ──
 
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_dejavu_registered = False
+
+
+def _register_unicode_font():
+    """
+    Zaregistruje DejaVu Sans (podporuje slovenskú diakritiku – č, š, ľ, ť, ž...).
+    Bez tohto xhtml2pdf použije predvolený Helvetica font, ktorý diakritiku
+    nevykreslí (zobrazí namiesto nej čierne štvorčeky).
+    """
+    global _dejavu_registered
+    if _dejavu_registered:
+        return
+    regular_path = os.path.join(_FONTS_DIR, "DejaVuSans.ttf")
+    bold_path = os.path.join(_FONTS_DIR, "DejaVuSans-Bold.ttf")
+    pdfmetrics.registerFont(TTFont("DejaVuSans", regular_path))
+    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_path))
+    pdfmetrics.registerFontFamily(
+        "DejaVuSans", normal="DejaVuSans", bold="DejaVuSans-Bold",
+        italic="DejaVuSans", boldItalic="DejaVuSans-Bold",
+    )
+    _dejavu_registered = True
+
+
 def convert_report_to_pdf(markdown_text, homepage_url):
     """Skonvertuje vygenerovaný markdown report na PDF (bytes) na stiahnutie."""
+    _register_unicode_font()
     html_body = markdown2.markdown(markdown_text, extras=["tables", "fenced-code-blocks"])
     html_full = f"""
     <html>
@@ -129,13 +157,14 @@ def convert_report_to_pdf(markdown_text, homepage_url):
     <meta charset="UTF-8">
     <style>
         @page {{ size: A4; margin: 2cm; }}
-        body {{ font-family: Helvetica, sans-serif; font-size: 10pt; line-height: 1.5; color: #222; }}
-        h1 {{ font-size: 18pt; color: #111; border-bottom: 2px solid #444; padding-bottom: 6px; }}
-        h2 {{ font-size: 14pt; color: #222; margin-top: 20px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
-        h3 {{ font-size: 12pt; color: #333; margin-top: 14px; }}
+        body {{ font-family: "DejaVuSans"; font-size: 10pt; line-height: 1.5; color: #222; }}
+        h1 {{ font-family: "DejaVuSans-Bold"; font-size: 18pt; color: #111; border-bottom: 2px solid #444; padding-bottom: 6px; }}
+        h2 {{ font-family: "DejaVuSans-Bold"; font-size: 14pt; color: #222; margin-top: 20px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
+        h3 {{ font-family: "DejaVuSans-Bold"; font-size: 12pt; color: #333; margin-top: 14px; }}
+        b, strong {{ font-family: "DejaVuSans-Bold"; }}
         table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
-        th, td {{ border: 1px solid #999; padding: 6px 8px; font-size: 9pt; text-align: left; }}
-        th {{ background-color: #eee; }}
+        th, td {{ border: 1px solid #999; padding: 6px 8px; font-size: 9pt; text-align: left; font-family: "DejaVuSans"; }}
+        th {{ background-color: #eee; font-family: "DejaVuSans-Bold"; }}
         code {{ background-color: #f2f2f2; padding: 1px 4px; }}
     </style>
     </head>
