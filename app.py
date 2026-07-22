@@ -150,6 +150,44 @@ def _get_dejavu_font_paths():
     return _dejavu_font_paths
 
 
+import re
+
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "\U0000FE0F"
+    "]+", flags=re.UNICODE,
+)
+
+
+def strip_emoji_for_pdf(text):
+    """
+    DejaVu Sans (font použitý v PDF) nemá farebné emoji glyfy – Gemini ich ale bežne
+    používa v tabuľkách (🔥 pre dopad, 🟢/🟡/🔴 pre náročnosť). Bez tohto by fpdf2
+    hlásil chýbajúce glyfy a v PDF by boli namiesto emoji prázdne/čierne štvorčeky.
+    V zobrazenom reporte v appke (Streamlit markdown) a v TXT verzii emoji zostávajú.
+    """
+    cleaned = _EMOJI_PATTERN.sub("", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
+
+
+def sanitize_table_cells_for_pdf(html):
+    """
+    fpdf2 (na rozdiel od xhtml2pdf) nepodporuje vnorené HTML tagy v bunkách tabuľky
+    (napr. <td><strong>text</strong></td> spôsobí pád). Odstránime formátovacie tagy
+    len vnútri <td>/<th>, mimo tabuliek zostáva formátovanie zachované.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for cell in soup.find_all(["td", "th"]):
+        for tag in cell.find_all(["strong", "em", "b", "i", "code"]):
+            tag.unwrap()
+    return str(soup)
+
+
 def convert_report_to_pdf(markdown_text, homepage_url):
     """
     Skonvertuje vygenerovaný markdown report na PDF (bytes) na stiahnutie.
@@ -160,7 +198,9 @@ def convert_report_to_pdf(markdown_text, homepage_url):
     """
     regular_path, bold_path = _get_dejavu_font_paths()
 
+    markdown_text = strip_emoji_for_pdf(markdown_text)
     html_body = markdown2.markdown(markdown_text, extras=["tables", "fenced-code-blocks"])
+    html_body = sanitize_table_cells_for_pdf(html_body)
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
